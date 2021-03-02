@@ -36,8 +36,14 @@ import Prelude
     ( String )
 import System.Directory
     ( doesFileExist, renameFile )
+import System.IO (hGetContents, stdin, IOMode(ReadMode), withFile)
 import System.Environment
     ( lookupEnv )
+import           Colog                         (pattern D, pattern E, pattern I,
+                                                LogAction, Message, WithLog,
+                                                cmap, filterBySeverity,
+                                                fmtMessage, log, logTextStdout,
+                                                msgSeverity, usingLoggerT)
 
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Encode.Pretty as Aeson
@@ -48,13 +54,16 @@ import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy.Char8 as BL8
 import qualified Data.Text as T
 import qualified Options.Applicative as OA
+import qualified Text.Megaparsec               as P
+import qualified Text.Megaparsec.Char          as P
 
 main :: IO ()
 main = do
     defaultSubject <- fmap (Subject . T.pack) <$> lookupEnv "METADATA_SUBJECT"
-    args <- OA.execParser $ OA.info (argumentParser defaultSubject <**> OA.helper) mempty
+    args <- OA.execParser $ OA.info (argumentParser defaultSubject) mempty
     case args of
-        ArgumentsEntryUpdate eua  -> handleEntryUpdateArguments eua
+        ArgumentsEntryUpdate eua            -> handleEntryUpdateArguments eua
+        ArgumentsValidate mValidateThisFile -> _handleValidate mValidateThisFile
 
 data DraftStatus
     = DraftStatusDraft
@@ -105,6 +114,7 @@ data EntryUpdateArguments = EntryUpdateArguments
 
 data Arguments
     = ArgumentsEntryUpdate EntryUpdateArguments
+    | ArgumentsValidate (Maybe FilePath)
     deriving Show
 
 wellKnownOption
@@ -342,7 +352,85 @@ handleEntryUpdateArguments (EntryUpdateArguments fInfo keyfile props newEntryInf
         json <- registryJSON
         left T.pack $ Aeson.parseEither parseRegistryEntry json
 
+validateArgumentParser = undefined
+
+handleValidate :: Severity -> SlotNo -> FilePath -> IO ()
+handleValidate logSeverity slotNo fp =
+  let
+    logAction :: MonadIO m => LogAction m Message
+    logAction = filterBySeverity logSeverity msgSeverity (cmap fmtMessage logTextStdout)
+
+  usingLoggerT action $ do
+    contents <- readFile fp
+    runExceptT $ validateFileContents filePath contents slotNo
+
 argumentParser :: Maybe Subject -> OA.Parser Arguments
-argumentParser defaultSubject = asum
-    [ ArgumentsEntryUpdate <$> entryUpdateArgumentParser defaultSubject
-    ]
+argumentParser defaultSubject =
+  OA.hsubparser 
+    ( OA.command "update" (OA.info (ArgumentsEntryUpdate <$> entryUpdateArgumentParser defaultSubject) mempty)
+   <> OA.command "validate" (OA.info (ArgumentsValidate <$> validateArgumentParser) mempty)
+    )
+
+data MetadataValidationError
+  = MetadataBadFileName FilePath
+  -- ^ The metadata's file name failed to validate
+  | MetadataTooLarge Int Int
+  -- ^ The metadata is too large.
+  | MetadataFailedToParse Text
+  -- ^ Failed to parse a metadata entry from the file contents
+  | MetadataFailedToValidate Text
+  -- ^ Failed to validate the metadata entry
+
+validateFileContents :: (WithLogEnv env Message m, MonadError MetadataValidatorError m) => FilePath -> String -> SlotNo -> m ()
+validateFileContents fileName contents = 
+  log I $ "Validating file " <> T.pack fileName
+  log D $ "File contents: " <> T.pack contents
+
+  case P.runParser pFileName fileName of
+    Left err -> do
+      let errPretty = P.errorBundlePretty err
+      log E $ T.pack $ "Failed to parse file name, error was: '" <> errPretty <> "'."
+      throwError $ MetadataBadFileName errPretty
+    Right _ -> do
+      let contentLength = length contents
+
+      if contentLength > metadataJSONMaxSize
+        then do
+          log E ("File size in bytes (" <> T.pack (show contentLength) <> ") greater than maximum size of " <> T.pack (show metadataJSONMaxSize) <> " bytes.")
+          throwError $ MetadataTooLarge contentLength metadataJSONMaxSize
+        else
+          log I ("Good file size ( " <> T.pack (show contentLength) <> " < " <> T.pack (show metadataJSONMaxSize) <> " bytes)")
+
+      case Aeson.eitherDecodeWith Aeson.value (Aeson.parse parseRegistryEntry) (B8L.pack content) of
+        Left err -> do
+          log E $ T.pack $ "Cannot parse a wallet metadata value from '" <> T.pack content <> "'. Error was: " <> T.pack (show err) <> "."
+          throwError $ MetadataFailedToParse err
+        Right entry -> do
+          log I $ T.pack $ "Successfully decoded entry: " <> show entry
+          log I $ T.pack "Validating attestation signatures and content..."
+
+          case validateEntry slotNo entry of
+            Left err -> do
+              log E $ "Failed to validate wallet metadata entry '" <> T.pack (show entry) <> "', error was: '" <> err <> "'."
+              throwError $ MetadataFailedToValidate err
+            Right () ->
+              log I "PR valid!"
+
+-- | Maximum size in bytes of a metadata entry.
+metadataJSONMaxSize :: Int64
+metadataJSONMaxSize = 380000
+
+type Parser = P.Parsec Void Text
+
+pFileName :: Parser Text
+pFileName = do
+  (fileName :: Text) <- P.takeWhile1P (Just "printable Unicode character") (\c -> isPrint c && c /= '.')
+
+  let len = T.length fileName
+  if len < 1 || len > 256
+    then fail $ "Expected 1-256 chars but found " <> show len <> "."
+    else pure ()
+
+  _fileSuffix <- P.string ".json"
+  P.eof
+  pure fileName
