@@ -55,8 +55,7 @@ import           Colog                         (pattern D, pattern E, pattern I,
                                                 msgSeverity)
 
 import qualified Data.Aeson as Aeson
-import qualified Data.Aeson.Parser as Aeson
-import qualified Data.Aeson.Internal as Aeson
+import qualified Data.Bifunctor as Bifunctor
 import qualified Data.Aeson.Encode.Pretty as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString as BS
@@ -64,17 +63,26 @@ import qualified Data.ByteString.Base64 as B64
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy.Char8 as BL8
 import qualified Data.Text as T
+import qualified Data.Text.Lazy as TL
+import qualified Data.Text.Lazy.Encoding as TL
 import qualified Options.Applicative as OA
 import qualified Text.Megaparsec               as P
 import qualified Text.Megaparsec.Char          as P
+import qualified Text.Megaparsec.Char.Lexer    as P
 
 main :: IO ()
 main = do
     defaultSubject <- fmap (Subject . T.pack) <$> lookupEnv "METADATA_SUBJECT"
-    args <- OA.execParser $ OA.info (argumentParser defaultSubject) mempty
+    args <- OA.execParser $ OA.info (argumentParser defaultSubject <**> OA.helper) mempty
     case args of
-        ArgumentsEntryUpdate eua             -> handleEntryUpdateArguments eua
-        ArgumentsValidate fp slotNo severity -> handleValidate severity slotNo fp
+        ArgumentsEntryUpdate eua              -> handleEntryUpdateArguments eua
+        ArgumentsValidate fp slotNoPref severity -> do
+          slotNo <- case slotNoPref of
+              MainnetTip     -> getCurrentSlot mainnetSlotParameters
+              TestnetTip     -> getCurrentSlot testnetSlotParameters
+              CustomSlot num -> pure num
+
+          handleValidate severity slotNo fp
 
 data DraftStatus
     = DraftStatusDraft
@@ -125,7 +133,7 @@ data EntryUpdateArguments = EntryUpdateArguments
 
 data Arguments
     = ArgumentsEntryUpdate EntryUpdateArguments
-    | ArgumentsValidate FilePath SlotNo Severity
+    | ArgumentsValidate FilePath SlotNoPreference Severity
     deriving Show
 
 wellKnownOption
@@ -395,31 +403,44 @@ newtype App e a = App
 runApp :: Env (App e) -> App e a -> IO (Either e a)
 runApp env = runExceptT . flip runReaderT env . unApp
 
--- instance Monad m => HasLog (LogAction m Message) Message (ExceptT e m) where
---     getLogAction = liftLogAction
---     {-# INLINE getLogAction #-}
-
---     setLogAction = setLogAction
---     {-# INLINE setLogAction #-}
-
 argumentParser :: Maybe Subject -> OA.Parser Arguments
 argumentParser defaultSubject =
   OA.hsubparser 
     ( OA.command "update" (OA.info (ArgumentsEntryUpdate <$> entryUpdateArgumentParser defaultSubject) mempty)
-   <> OA.command "validate" (OA.info (ArgumentsValidate <$> pFile <*> pSlotNo <*> pLogSeverity) mempty)
+   <> OA.command "validate" (OA.info (ArgumentsValidate <$> pFile <*> pSlotNoPreference <*> pLogSeverity) mempty)
     )
 
   where
     pFile :: OA.Parser FilePath
     pFile = OA.strArgument (OA.metavar "FILEPATH" <> OA.help "File to validate")
 
-pSlotNo :: OA.Parser SlotNo
-pSlotNo = SlotNo
-    <$> OA.option OA.auto
-          ( OA.long "slot-no"
-          <> OA.metavar "WORD64"
-          <> OA.help "Slot number to query"
-          )
+data SlotNoPreference
+  = MainnetTip
+  | TestnetTip
+  | CustomSlot SlotNo
+  deriving (Eq, Show)
+
+pSlotNoPreference :: OA.Parser SlotNoPreference
+pSlotNoPreference = 
+  OA.option (readerFromParser pSlotPref)
+    ( OA.long "slot-no"
+    <> OA.help "Slot number to use to validate wallet metadata scripts (mainnet | testnet | <WORD64>)"
+    )
+
+pSlotPref :: Parser SlotNoPreference
+pSlotPref = asum [ MainnetTip <$ P.string "mainnet"
+                 , TestnetTip <$ P.string "testnet"
+                 , CustomSlot <$> P.decimal
+                 , pure MainnetTip
+                 ]
+
+readerFromParser :: Parser a -> OA.ReadM a
+readerFromParser p =
+  OA.eitherReader
+    (  Bifunctor.first P.errorBundlePretty
+     . P.runParser (p <* P.eof) "cmd-line-args"
+     . T.pack
+    )
 
 pLogSeverity :: OA.Parser Colog.Severity
 pLogSeverity = pDebug <|> pInfo <|> pWarning <|> pError <|> pure I
@@ -450,8 +471,10 @@ data MetadataValidationError
   -- ^ The metadata's file name failed to validate
   | MetadataTooLarge Int64 Int64
   -- ^ The metadata is too large (actual, limit).
-  | MetadataFailedToParse String (Aeson.JSONPath, String)
-  -- ^ Failed to parse a metadata entry from the file contents (contents, err)
+  | MetadataFailedToParseJSON String String
+  -- ^ Failed to parse a JSON value from the file contents (contents, err)
+  | MetadataFailedToParseRegistryEntry Aeson.Value String
+  -- ^ Failed to parse a metadata entry from the file contents (json value, err)
   | MetadataFailedToValidate PartialGoguenRegistryEntry Text
   -- ^ Failed to validate the metadata entry (json value, err)
 
@@ -460,10 +483,12 @@ prettyPrintMetadataValidationError (MetadataBadFileName fp err) =
   "Failed to parse file name '" <> T.pack fp <> "', error was '" <> T.pack (P.errorBundlePretty err) <> "'."
 prettyPrintMetadataValidationError (MetadataTooLarge actual limit) =
   "File size in bytes (" <> T.pack (show actual) <> " bytes) greater than maximum size of " <> T.pack (show limit) <> " bytes."
-prettyPrintMetadataValidationError (MetadataFailedToParse contents (jsonPath, err)) =
-  "Cannot parse JSON '" <> T.pack contents <> "'. Error was: " <> T.pack (Aeson.formatError jsonPath err) <> "."
+prettyPrintMetadataValidationError (MetadataFailedToParseJSON contents err) =
+  "Failed to parse valid JSON from: '" <> T.pack contents <> "', error was: " <> T.pack err <> "."
+prettyPrintMetadataValidationError (MetadataFailedToParseRegistryEntry val err) =
+  "Failed to parse wallet metadata entry from JSON: '" <> T.pack (show val) <> "', error was: " <> T.pack err <> "."
 prettyPrintMetadataValidationError (MetadataFailedToValidate val err) =
- "Failed to validate wallet metadata entry '" <> T.pack (show val) <> "', error was: '" <> err <> "'."
+  "Failed to validate wallet metadata entry '" <> T.pack (show val) <> "', error was: '" <> err <> "'."
 
 validateFileContents :: (WithLog env Message m, MonadError MetadataValidationError m) => FilePath -> String -> SlotNo -> m ()
 validateFileContents fileName contents slotNo = do
@@ -486,22 +511,29 @@ validateFileContents fileName contents slotNo = do
         else
           log I ("Good file size ( " <> T.pack (show contentLength) <> " < " <> T.pack (show metadataJSONMaxSize) <> " bytes)")
 
-      case Aeson.eitherDecodeWith Aeson.value (Aeson.iparse parseRegistryEntry) (BL8.pack contents) of
-        Left e -> do
-          let err = MetadataFailedToParse contents e
+      -- Must use encodeUtf8 otherwise Aeson will fail on decoding Utf characters
+      case Aeson.eitherDecode (TL.encodeUtf8 . TL.pack $ contents) of
+        Left e     -> do
+          let err = MetadataFailedToParseJSON contents e
           log E $ prettyPrintMetadataValidationError err
           throwError err
-        Right entry -> do
-          log I $ T.pack $ "Successfully decoded entry: " <> show entry
-          log I $ "Validating attestation signatures and content..."
-
-          case validateEntry slotNo entry of
+        Right json -> do
+          case Aeson.parseEither parseRegistryEntry json of
             Left e -> do
-              let err = MetadataFailedToValidate entry e
+              let err = MetadataFailedToParseRegistryEntry json e
               log E $ prettyPrintMetadataValidationError err
               throwError err
-            Right () ->
-              log I "PR valid!"
+            Right entry -> do
+              log I $ T.pack $ "Successfully decoded entry: " <> show entry
+              log I $ "Validating attestation signatures and content..."
+    
+              case validateEntry slotNo entry of
+                Left e -> do
+                  let err = MetadataFailedToValidate entry e
+                  log E $ prettyPrintMetadataValidationError err
+                  throwError err
+                Right () ->
+                  log I "PR valid!"
 
 -- | Maximum size in bytes of a metadata entry.
 metadataJSONMaxSize :: Int64
