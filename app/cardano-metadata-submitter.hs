@@ -2,8 +2,16 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
-import Cardano.Prelude
+{-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+
+import Cardano.Prelude hiding (log)
 
 import Cardano.Api
     ( AsType (AsPaymentExtendedKey, AsPaymentKey) )
@@ -28,24 +36,27 @@ import Cardano.Metadata.Types
     , emptyAttested
     , hashesForAttestation
     )
+import Cardano.Slotting.Slot
+    ( SlotNo (..) )
 import Control.Arrow
     ( left )
 import Data.List
     ( isSuffixOf )
 import Prelude
-    ( String )
+    ( String, fail, error)
 import System.Directory
     ( doesFileExist, renameFile )
-import System.IO (hGetContents, stdin, IOMode(ReadMode), withFile)
 import System.Environment
     ( lookupEnv )
-import           Colog                         (pattern D, pattern E, pattern I,
-                                                LogAction, Message, WithLog,
+import           Colog                         (pattern D, pattern E, pattern I, pattern W,
+                                                LogAction, Message, WithLog, Severity, HasLog, getLogAction, setLogAction,
                                                 cmap, filterBySeverity,
                                                 fmtMessage, log, logTextStdout,
-                                                msgSeverity, usingLoggerT)
+                                                msgSeverity)
 
 import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Parser as Aeson
+import qualified Data.Aeson.Internal as Aeson
 import qualified Data.Aeson.Encode.Pretty as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString as BS
@@ -62,8 +73,8 @@ main = do
     defaultSubject <- fmap (Subject . T.pack) <$> lookupEnv "METADATA_SUBJECT"
     args <- OA.execParser $ OA.info (argumentParser defaultSubject) mempty
     case args of
-        ArgumentsEntryUpdate eua            -> handleEntryUpdateArguments eua
-        ArgumentsValidate mValidateThisFile -> _handleValidate mValidateThisFile
+        ArgumentsEntryUpdate eua             -> handleEntryUpdateArguments eua
+        ArgumentsValidate fp slotNo severity -> handleValidate severity slotNo fp
 
 data DraftStatus
     = DraftStatusDraft
@@ -114,7 +125,7 @@ data EntryUpdateArguments = EntryUpdateArguments
 
 data Arguments
     = ArgumentsEntryUpdate EntryUpdateArguments
-    | ArgumentsValidate (Maybe FilePath)
+    | ArgumentsValidate FilePath SlotNo Severity
     deriving Show
 
 wellKnownOption
@@ -352,67 +363,143 @@ handleEntryUpdateArguments (EntryUpdateArguments fInfo keyfile props newEntryInf
         json <- registryJSON
         left T.pack $ Aeson.parseEither parseRegistryEntry json
 
-validateArgumentParser = undefined
-
 handleValidate :: Severity -> SlotNo -> FilePath -> IO ()
-handleValidate logSeverity slotNo fp =
+handleValidate logSeverity slotNo fp = do
   let
     logAction :: MonadIO m => LogAction m Message
     logAction = filterBySeverity logSeverity msgSeverity (cmap fmtMessage logTextStdout)
 
-  usingLoggerT action $ do
-    contents <- readFile fp
-    runExceptT $ validateFileContents filePath contents slotNo
+    env = Env logAction
+
+  r <- runApp env $ do
+    contents <- liftIO $ readFile fp
+    validateFileContents fp (T.unpack contents) slotNo
+
+  either (error . T.unpack . prettyPrintMetadataValidationError) pure r
+
+data Env m = Env
+    { envLogAction  :: !(LogAction m Message)
+    }
+    
+instance HasLog (Env m) Message m where
+    getLogAction = envLogAction
+    {-# INLINE getLogAction #-}
+
+    setLogAction newLogAction env = env { envLogAction = newLogAction }
+    {-# INLINE setLogAction #-}
+
+newtype App e a = App
+    { unApp :: ReaderT (Env (App e)) (ExceptT e IO) a
+    } deriving newtype (Functor, Applicative, Monad, MonadIO, MonadReader (Env (App e)), MonadError e)
+
+runApp :: Env (App e) -> App e a -> IO (Either e a)
+runApp env = runExceptT . flip runReaderT env . unApp
+
+-- instance Monad m => HasLog (LogAction m Message) Message (ExceptT e m) where
+--     getLogAction = liftLogAction
+--     {-# INLINE getLogAction #-}
+
+--     setLogAction = setLogAction
+--     {-# INLINE setLogAction #-}
 
 argumentParser :: Maybe Subject -> OA.Parser Arguments
 argumentParser defaultSubject =
   OA.hsubparser 
     ( OA.command "update" (OA.info (ArgumentsEntryUpdate <$> entryUpdateArgumentParser defaultSubject) mempty)
-   <> OA.command "validate" (OA.info (ArgumentsValidate <$> validateArgumentParser) mempty)
+   <> OA.command "validate" (OA.info (ArgumentsValidate <$> pFile <*> pSlotNo <*> pLogSeverity) mempty)
     )
 
-data MetadataValidationError
-  = MetadataBadFileName FilePath
-  -- ^ The metadata's file name failed to validate
-  | MetadataTooLarge Int Int
-  -- ^ The metadata is too large.
-  | MetadataFailedToParse Text
-  -- ^ Failed to parse a metadata entry from the file contents
-  | MetadataFailedToValidate Text
-  -- ^ Failed to validate the metadata entry
+  where
+    pFile :: OA.Parser FilePath
+    pFile = OA.strArgument (OA.metavar "FILEPATH" <> OA.help "File to validate")
 
-validateFileContents :: (WithLogEnv env Message m, MonadError MetadataValidatorError m) => FilePath -> String -> SlotNo -> m ()
-validateFileContents fileName contents = 
+pSlotNo :: OA.Parser SlotNo
+pSlotNo = SlotNo
+    <$> OA.option OA.auto
+          ( OA.long "slot-no"
+          <> OA.metavar "WORD64"
+          <> OA.help "Slot number to query"
+          )
+
+pLogSeverity :: OA.Parser Colog.Severity
+pLogSeverity = pDebug <|> pInfo <|> pWarning <|> pError <|> pure I
+  where
+    pDebug =
+      OA.flag' D
+        (  OA.long "debug"
+        <> OA.help "Print debug, info, warning, and error messages"
+        )
+    pInfo =
+      OA.flag' I
+        (  OA.long "info"
+        <> OA.help "Print info, warning, and error messages"
+        )
+    pWarning =
+      OA.flag' W
+        (  OA.long "warning"
+        <> OA.help "Print warning, and error messages"
+        )
+    pError =
+      OA.flag' E
+        (  OA.long "error"
+        <> OA.help "Print error messages only"
+        )
+
+data MetadataValidationError
+  = MetadataBadFileName FilePath (P.ParseErrorBundle Text Void)
+  -- ^ The metadata's file name failed to validate
+  | MetadataTooLarge Int64 Int64
+  -- ^ The metadata is too large (actual, limit).
+  | MetadataFailedToParse String (Aeson.JSONPath, String)
+  -- ^ Failed to parse a metadata entry from the file contents (contents, err)
+  | MetadataFailedToValidate PartialGoguenRegistryEntry Text
+  -- ^ Failed to validate the metadata entry (json value, err)
+
+prettyPrintMetadataValidationError :: MetadataValidationError -> Text
+prettyPrintMetadataValidationError (MetadataBadFileName fp err) =
+  "Failed to parse file name '" <> T.pack fp <> "', error was '" <> T.pack (P.errorBundlePretty err) <> "'."
+prettyPrintMetadataValidationError (MetadataTooLarge actual limit) =
+  "File size in bytes (" <> T.pack (show actual) <> " bytes) greater than maximum size of " <> T.pack (show limit) <> " bytes."
+prettyPrintMetadataValidationError (MetadataFailedToParse contents (jsonPath, err)) =
+  "Cannot parse JSON '" <> T.pack contents <> "'. Error was: " <> T.pack (Aeson.formatError jsonPath err) <> "."
+prettyPrintMetadataValidationError (MetadataFailedToValidate val err) =
+ "Failed to validate wallet metadata entry '" <> T.pack (show val) <> "', error was: '" <> err <> "'."
+
+validateFileContents :: (WithLog env Message m, MonadError MetadataValidationError m) => FilePath -> String -> SlotNo -> m ()
+validateFileContents fileName contents slotNo = do
   log I $ "Validating file " <> T.pack fileName
   log D $ "File contents: " <> T.pack contents
 
-  case P.runParser pFileName fileName of
-    Left err -> do
-      let errPretty = P.errorBundlePretty err
-      log E $ T.pack $ "Failed to parse file name, error was: '" <> errPretty <> "'."
-      throwError $ MetadataBadFileName errPretty
+  case (P.runParser pFileName fileName (T.pack fileName)) of
+    Left e -> do
+      let err = MetadataBadFileName fileName e
+      log E $ prettyPrintMetadataValidationError err
+      throwError err
     Right _ -> do
-      let contentLength = length contents
+      let contentLength = fromIntegral $ length contents
 
       if contentLength > metadataJSONMaxSize
         then do
-          log E ("File size in bytes (" <> T.pack (show contentLength) <> ") greater than maximum size of " <> T.pack (show metadataJSONMaxSize) <> " bytes.")
-          throwError $ MetadataTooLarge contentLength metadataJSONMaxSize
+          let err = MetadataTooLarge contentLength metadataJSONMaxSize
+          log E $ prettyPrintMetadataValidationError err
+          throwError err
         else
           log I ("Good file size ( " <> T.pack (show contentLength) <> " < " <> T.pack (show metadataJSONMaxSize) <> " bytes)")
 
-      case Aeson.eitherDecodeWith Aeson.value (Aeson.parse parseRegistryEntry) (B8L.pack content) of
-        Left err -> do
-          log E $ T.pack $ "Cannot parse a wallet metadata value from '" <> T.pack content <> "'. Error was: " <> T.pack (show err) <> "."
-          throwError $ MetadataFailedToParse err
+      case Aeson.eitherDecodeWith Aeson.value (Aeson.iparse parseRegistryEntry) (BL8.pack contents) of
+        Left e -> do
+          let err = MetadataFailedToParse contents e
+          log E $ prettyPrintMetadataValidationError err
+          throwError err
         Right entry -> do
           log I $ T.pack $ "Successfully decoded entry: " <> show entry
-          log I $ T.pack "Validating attestation signatures and content..."
+          log I $ "Validating attestation signatures and content..."
 
           case validateEntry slotNo entry of
-            Left err -> do
-              log E $ "Failed to validate wallet metadata entry '" <> T.pack (show entry) <> "', error was: '" <> err <> "'."
-              throwError $ MetadataFailedToValidate err
+            Left e -> do
+              let err = MetadataFailedToValidate entry e
+              log E $ prettyPrintMetadataValidationError err
+              throwError err
             Right () ->
               log I "PR valid!"
 

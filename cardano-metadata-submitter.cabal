@@ -59,6 +59,7 @@ executable cardano-metadata-submitter
                      , co-log
                      , directory
                      , optparse-applicative
+                     , megaparsec
                      , text
                      , cardano-api
                      , cardano-cli
