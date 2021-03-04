@@ -26,6 +26,7 @@ import Cardano.Metadata.GoguenRegistry
     , validateEntry
     )
 import Cardano.Metadata.Types ( Subject(Subject))
+import System.FilePath.Posix (takeBaseName)
 
 import qualified Text.Megaparsec               as P
 import qualified Text.Megaparsec.Char          as P
@@ -90,13 +91,13 @@ validateFileContents
   -> String
   -> SlotNo
   -> m ()
-validateFileContents fileName contents slotNo = do
-  log I $ "Validating file " <> T.pack fileName
+validateFileContents filePath contents slotNo = do
+  log I $ "Validating file " <> T.pack filePath
   log D $ "File contents: " <> T.pack contents
 
-  case (P.runParser pFileName fileName (T.pack fileName)) of
+  case (P.runParser pFileName filePath (T.pack filePath)) of
     Left e -> do
-      logAndThrowError $ MetadataBadFileName fileName e
+      logAndThrowError $ MetadataBadFileName filePath e
     Right _ -> do
       let contentLength = fromIntegral $ length contents
 
@@ -126,9 +127,10 @@ validateFileContents fileName contents slotNo = do
                     Nothing             -> do
                       logAndThrowError $ MetadataMissingSubject entry
                     Just (Subject subj) -> do
-                      if (T.pack fileName) /= subj
+                      let baseName = T.pack $ takeBaseName $ filePath
+                      if baseName /= subj
                         then do
-                          logAndThrowError $ MetadataSubjectFileNameMismatch (Subject subj) fileName
+                          logAndThrowError $ MetadataSubjectFileNameMismatch (Subject subj) filePath
                         else do
                           log I "File valid!"
 
