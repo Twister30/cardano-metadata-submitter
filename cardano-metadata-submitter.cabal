@@ -19,6 +19,7 @@ library
   exposed-modules: Cardano.Metadata.Types
                  , Cardano.Metadata.GoguenRegistry
                  , Cardano.Metadata.CurrentSlot
+                 , Cardano.Metadata.Validate.Wallet
   other-modules: AesonHelpers
   build-depends: base
                , aeson
@@ -40,6 +41,9 @@ library
                , containers
                , cborg
                , time
+               , co-log
+               , megaparsec
+               , mtl
   hs-source-dirs: src
   default-language: Haskell2010
   default-extensions: NoImplicitPrelude
@@ -71,3 +75,4 @@ executable cardano-metadata-submitter
                       OverloadedStrings
   if (!flag(development))
     ghc-options: -Werror -Wall
+  other-modules:       Config
